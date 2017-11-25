@@ -201,7 +201,6 @@ func CreateRequestForPostHandler(handler string, body []byte) (*http.Request, er
 	if err != nil {
 		return nil, err
 	}
-	log.Println("BODY2: " + string(body2))
 	ExtraHeaders(req, "POST", uri.Path, string(body))
 	return req, nil
 }
@@ -230,12 +229,12 @@ func GetHandler(handler string) (interface{}, error) {
 	return i, nil
 }
 
-func PostHandler(handler string, request *YcmdRequest) (interface{}, error) {
+func PostHandler(handler string, request *YcmdRequest) ([]byte, error) {
 	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
 	}
-	log.Println(string(body))
+	//log.Println(string(body))
 	req, err := CreateRequestForPostHandler(handler, body)
 	if err != nil {
 		return nil, err
@@ -252,12 +251,10 @@ func PostHandler(handler string, request *YcmdRequest) (interface{}, error) {
 		return nil, err
 	}
 	log.Printf("Raw Ycmd Response: %s\n", string(blob))
-	var i interface{}
-	err = json.Unmarshal(blob, &i)
-	if err != nil {
-		return nil, err
+	if resp.StatusCode == 500 {
+		return nil, errors.New(string(blob))
 	}
-	return i, nil
+	return blob, nil
 }
 
 func IsReady() bool {
@@ -376,6 +373,10 @@ func WhichAcmeButton(e *acme.Event) (AcmeButton, error) {
 }
 
 func GetAcmeWindowBody(a *acme.Win) (string, error) {
+	err := a.Addr("#0")
+	if err != nil {
+		return "", err
+	}
 	body, err := a.ReadAll("data")
 	if err != nil {
 		return "", err
@@ -397,9 +398,13 @@ func GetAcmeWindowLineAndColumn(a *acme.Win, body string) (*LineAndColumn, error
 	if err != nil {
 		return nil, err
 	}
+	if len(body) <= q0 {
+		return nil, errors.New(fmt.Sprintf("Acme body size is smaller than q0: %d <= %d", len(body), q0))
+	}
 	log.Printf("Acme Window Addr: %d, %d", q0, q1)
 	lastLinePosition := 0
 	lineAndColumn := &LineAndColumn{Line: 1}
+
 	for i := 0; i < q0; i++ {
 		if body[i] == '\n' {
 			lastLinePosition = i
@@ -417,11 +422,20 @@ type Ide interface {
 
 	// Watch for events continuously until the window is closed.
 	Watch()
+
+	// Ensure any resources allocated by this Ide are deallocated.
+	Teardown()
+
+	// The window, file, or directory name
+	Name() string
+
+	// The window id
+	Id() int
 }
 
 type PythonIde struct {
-	Id      int
-	Name    string
+	id      int
+	name    string
 	isSetup bool
 	acmeWin *acme.Win
 }
@@ -443,9 +457,17 @@ func (p *PythonIde) setupIdeTag() error {
 	return nil
 }
 
+func (p *PythonIde) Name() string {
+	return p.name
+}
+
+func (p *PythonIde) Id() int {
+	return p.id
+}
+
 func (p *PythonIde) Setup() error {
 	var err error
-	p.acmeWin, err = acme.Open(p.Id, nil)
+	p.acmeWin, err = acme.Open(p.Id(), nil)
 	if err != nil {
 		return err
 	}
@@ -457,6 +479,10 @@ func (p *PythonIde) Setup() error {
 		p.setupIdeTag()
 	}
 	return nil
+}
+
+func (p *PythonIde) Teardown() {
+	p.acmeWin.CloseFiles()
 }
 
 var PythonIdeCommands = map[string]struct{}{
@@ -511,6 +537,111 @@ func (p *PythonIde) IsIdeCommand(e *acme.Event) bool {
 	return ok
 }
 
+func AcmeWinIsDirectory(win *acme.Win) (bool, error) {
+	var ctlBytes []byte
+	_, err := win.Read("ctl", ctlBytes)
+	if err != nil {
+		return false, err
+	}
+	ctl := string(ctlBytes)
+	fields := strings.Split(ctl, " ")
+	if len(fields) < 5 {
+		return false, errors.New(fmt.Sprintf("Invalid ctl: %s", ctl))
+	}
+	directory, err := strconv.ParseInt(strings.TrimSpace(fields[4]), 10, 32)
+	if err != nil {
+		return false, err
+	}
+	return directory == 1, nil
+}
+
+func AcmeWinIsDirty(win *acme.Win) (bool, error) {
+	ctlBytes, err := win.ReadAll("ctl")
+	if err != nil {
+		log.Println("AcmeWinIsDirty: Error reading ctl: " + err.Error())
+		return false, err
+	}
+	ctl := string(ctlBytes)
+	fields := strings.Fields(ctl)
+	if len(fields) < 5 {
+		return false, errors.New(fmt.Sprintf("Invalid ctl: %s", ctl))
+	}
+
+	log.Printf("Ctl: %s\n", strings.Join(fields, ";"))
+	dirty, err := strconv.ParseInt(strings.TrimSpace(fields[5]), 10, 32)
+	if err != nil {
+		return false, err
+	}
+	return dirty == 1, nil
+}
+
+type AcmeLocation struct {
+	Filepath  string
+	LineNum   int
+	ColumnNum int
+}
+
+func AcmeJumpTo(ide Ide, win *acme.Win, filepath string, lineNum, columnNum int) error {
+	acmeWinIsDirty, err := AcmeWinIsDirty(win)
+	if err != nil {
+		return err
+	}
+
+	if acmeWinIsDirty || ide.Name() == filepath {
+		log.Println("AcmeJumpTo: Window is dirty or same window.")
+		// If the window is dirty, plumb the location to a new window so we don't lose any changes. If the window is
+		// already open somewhere, zap to it. We can also do this when we're zapping somewhere else in the same file.
+		cmd := exec.Command("plumb", fmt.Sprintf("%s:%d:%d", filepath, lineNum, columnNum))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Println(string(output))
+			return err
+		}
+	} else {
+		log.Println("AcmeJumpTo: Window is clean. Replacing")
+		// Open the new location in place
+		err = win.Addr("0,$")
+		if err != nil {
+			return err
+		}
+		log.Println("AcmeJumpTo: Set addr")
+		fileContents, err := ioutil.ReadFile(filepath)
+		if err != nil {
+			return err
+		}
+		log.Println("AcmeJumpTo: Read file " + filepath)
+		_, err = win.Write("data", fileContents)
+		if err != nil {
+			return err
+		}
+		log.Println("AcmeJumpTo: wrote data")
+		err = win.Name(filepath)
+		if err != nil {
+			return err
+		}
+		log.Println("AcmeJumpTo: wrote name")
+		newAddr := fmt.Sprintf("%d-+#%d", lineNum, columnNum)
+		err = win.Addr(newAddr)
+		if err != nil {
+			log.Printf("AcmeJumpTo: error writing addr: %s\n", newAddr)
+			return err
+		}
+		err = win.Ctl("dot=addr")
+		if err != nil {
+			log.Printf("AcmeJumpTo: error writing ctl: dot=addr\n")
+		}
+		err = win.Ctl("clean")
+		if err != nil {
+			log.Printf("AcmeJumpTo: error writing ctl: clean\n")
+		}
+		err = win.Ctl("show")
+		if err != nil {
+			log.Printf("AcmeJumpTo: error writing ctl: show\n")
+		}
+	}
+	return nil
+}
+
 func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 	if i.Command == "Def" {
 		body, err := GetAcmeWindowBody(p.acmeWin)
@@ -521,17 +652,40 @@ func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 		if err != nil {
 			return err
 		}
+		log.Printf("lineAndColumn: %d, %d\n", lineAndColumn.Line, lineAndColumn.Column)
 		ycmdRequest := &YcmdRequest{
 			LineNum:          lineAndColumn.Line,
 			ColumnNum:        lineAndColumn.Column,
-			Filepath:         p.Name,
+			Filepath:         p.Name(),
 			FileContents:     body,
 			CommandArguments: []string{"GoTo"},
 			Filetypes:        []string{"python"},
 		}
-		rsp, err := PostHandler("run_completer_command", ycmdRequest)
-		log.Println(rsp)
+		blob, err := PostHandler("run_completer_command", ycmdRequest)
+		if err != nil {
+			return err
+		}
+		var (
+			ycmdGoToSingleResponse = &YcmdGoToSingleResponse{}
+			ycmdGoToMultiResponse  = &YcmdGoToMultiResponse{}
+		)
+		err = json.Unmarshal(blob, ycmdGoToSingleResponse)
+		if err == nil {
+			err = AcmeJumpTo(p, p.acmeWin, ycmdGoToSingleResponse.Filepath,
+				ycmdGoToSingleResponse.LineNum, ycmdGoToSingleResponse.ColumnNum)
+			if err != nil {
+				return err
+			}
+			goto DONE
+		} else {
+			log.Printf("Json Unmarshal error: %s\n", string(blob))
+		}
+		err = json.Unmarshal(blob, ycmdGoToMultiResponse)
+		if err == nil {
+			log.Println("Received Multi Response")
+		}
 	}
+DONE:
 	return nil
 }
 
@@ -544,7 +698,10 @@ func (p *PythonIde) Watch() {
 		}
 		if p.IsIdeCommand(e) {
 			ideCommand := NewIdeCommand(e)
-			p.HandleCommand(ideCommand)
+			err := p.HandleCommand(ideCommand)
+			if err != nil {
+				log.Printf("HandleCommand error: %s\n", err)
+			}
 		} else {
 			p.acmeWin.WriteEvent(e)
 			continue
@@ -553,7 +710,7 @@ func (p *PythonIde) Watch() {
 }
 
 func NewPythonIde(winId int, winName string) *PythonIde {
-	return &PythonIde{Id: winId, Name: winName}
+	return &PythonIde{id: winId, name: winName}
 }
 
 func NewIde(winId int, winName string) Ide {
@@ -571,7 +728,12 @@ func WatchWindow(winId int, winName string) {
 	if ide == nil {
 		return
 	}
-	ide.Setup()
+	err := ide.Setup()
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer ide.Teardown()
 	ide.Watch()
 	log.Printf("Finished watching %s\n", winName)
 }

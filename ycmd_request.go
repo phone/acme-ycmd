@@ -42,10 +42,10 @@ func (r *YcmdRequest) MarshalJSON() ([]byte, error) {
 }
 
 type YcmdGoToSingleResponse struct {
-	LineNum     int
-	ColumnNum   int
-	Filepath    string
-	Description string
+	LineNum     int    `json:"line_num"`
+	ColumnNum   int    `json:"column_num"`
+	Filepath    string `json:"filepath"`
+	Description string `json:"description"`
 }
 
 type YcmdGoToMultiResponse []YcmdGoToSingleResponse

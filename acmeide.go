@@ -24,6 +24,8 @@ import (
 
 	"io"
 
+	"path/filepath"
+
 	"9fans.net/go/acme"
 	"github.com/phayes/freeport"
 )
@@ -436,6 +438,8 @@ type Ide interface {
 
 	// The window id
 	Id() int
+
+	Rename(name string)
 }
 
 type PythonIde struct {
@@ -464,6 +468,10 @@ func (p *PythonIde) setupIdeTag() error {
 
 func (p *PythonIde) Name() string {
 	return p.name
+}
+
+func (p *PythonIde) Rename(name string) {
+	p.name = name
 }
 
 func (p *PythonIde) Id() int {
@@ -616,6 +624,7 @@ func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 		if err != nil {
 			return err
 		}
+		ide.Rename(fileLocation.Filepath)
 		log.Println("AcmeJumpTo: wrote name")
 		err = win.Addr(fileLocation.Addr())
 		if err != nil {
@@ -652,6 +661,29 @@ func (p *PythonIde) WriteToErrors(content string) error {
 	if err != nil {
 		log.Println(out)
 		return err
+	}
+
+	// Let's try to show the window.
+	windows, err := acme.Windows()
+	if err != nil {
+		return err
+	}
+	seeking := fmt.Sprintf("%s/+Errors", filepath.Dir(p.Name()))
+
+	for _, window := range windows {
+		if window.Name == seeking {
+			return func(lines int) error {
+				w, err := acme.Open(window.ID, nil)
+				defer w.CloseFiles()
+				if err != nil {
+					return err
+				}
+				w.Addr("$-%d,$", lines-1) // Safe coz we pad newlines. Otherwise would be dangerous.
+				w.Ctl("dot=addr")
+				w.Ctl("show")
+				return nil
+			}(strings.Count(content, "\n"))
+		}
 	}
 	return nil
 }

@@ -22,6 +22,8 @@ import (
 
 	"bytes"
 
+	"io"
+
 	"9fans.net/go/acme"
 	"github.com/phayes/freeport"
 )
@@ -257,10 +259,10 @@ func PostHandler(handler string, request *YcmdRequest) ([]byte, error) {
 	return blob, nil
 }
 
-func IsReady() bool {
+func IsReady(duration time.Duration) bool {
 	var data interface{}
 	var err error
-	tick := time.Tick(5 * time.Second)
+	tick := time.Tick(duration)
 	for range tick {
 		data, err = GetHandler("ready")
 		if err != nil {
@@ -273,7 +275,7 @@ func IsReady() bool {
 }
 
 const GlobalWindowSuffix = "+IDE"
-const PythonTag = "Def Refs Fwd Bck In Out Up Dwn Find Case"
+const PythonTag = "Goto Nav In Out Up Dwn Find Case"
 
 type WindowType int
 
@@ -436,75 +438,6 @@ type Ide interface {
 	Id() int
 }
 
-var globalWindows = make(map[string]*GlobalWindow)
-var globalWindowsLock sync.Mutex
-
-func GetGlobalWindow(name string) (*GlobalWindow, error) {
-	globalWindowsLock.Lock()
-	defer globalWindowsLock.Unlock()
-	gw, ok := globalWindows[name]
-	if !ok {
-		gw, err := NewGlobalWindow()
-		if err != nil {
-			return nil, err
-		}
-		gw.win.Name(name)
-		globalWindows[name] = gw
-	}
-	return gw, nil
-}
-
-func DestroyGlobalWindow(name string) error {
-	globalWindowsLock.Lock()
-	defer globalWindowsLock.Unlock()
-	delete(globalWindows, name)
-	return nil
-}
-
-type GlobalWindowIde struct {
-	id   int
-	name string
-	gw   *GlobalWindow
-}
-
-func NewGlobalWindowIde(winId int, winName string) *GlobalWindowIde {
-	return &GlobalWindowIde{id: winId, name: winName}
-}
-
-func (g *GlobalWindowIde) Setup() error {
-	// Just make sure it exists and is set up, etc.
-	var err error
-	g.gw, err = GetGlobalWindow(g.name)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (g *GlobalWindowIde) Watch() {
-	log.Printf("GlobalWindow: %+v\n", g.gw)
-	// The only thing we have to watch for here is when it closes, so we can remove the references.
-	events := g.gw.EventChan()
-	for {
-		_, ok := <-events
-		if !ok {
-			break
-		}
-	}
-}
-
-func (g *GlobalWindowIde) Teardown() {
-	DestroyGlobalWindow(g.name)
-}
-
-func (g *GlobalWindowIde) Name() string {
-	return g.name
-}
-
-func (g *GlobalWindowIde) Id() int {
-	return g.id
-}
-
 type PythonIde struct {
 	id      int
 	name    string
@@ -558,10 +491,8 @@ func (p *PythonIde) Teardown() {
 }
 
 var PythonIdeCommands = map[string]struct{}{
-	"Def":  {},
-	"Refs": {},
-	"Fwd":  {},
-	"Bck":  {},
+	"Goto": {},
+	"Nav":  {},
 	"In":   {},
 	"Out":  {},
 	"Up":   {},
@@ -707,49 +638,27 @@ func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 	return nil
 }
 
-type GlobalWindow struct {
-	sync.Mutex
-	win *acme.Win
-}
-
-func NewGlobalWindow() (*GlobalWindow, error) {
-	w, err := acme.New()
-	if err != nil {
-		return nil, err
-	}
-	return &GlobalWindow{win: w}, nil
-}
-
-func (g *GlobalWindow) EventChan() <-chan *acme.Event {
-	g.Lock()
-	defer g.Unlock()
-	return g.win.EventChan()
-}
-
-func (g *GlobalWindow) AddContent(format string, args ...interface{}) error {
-	g.Lock()
-	defer g.Unlock()
-	err := g.win.Addr("$")
+func (p *PythonIde) WriteToErrors(content string) error {
+	cmd := exec.Command("9p", "write", fmt.Sprintf("acme/%d/errors", p.Id()))
+	inPipe, err := cmd.StdinPipe()
 	if err != nil {
 		return err
 	}
-	q0, q1, err := g.win.ReadAddr()
+	go func() {
+		defer inPipe.Close()
+		io.WriteString(inPipe, content)
+	}()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
-	}
-	err = g.win.Fprintf("data", format, args...)
-	if err != nil {
-		return err
-	}
-	err = g.win.Addr("#%d,#%d", q0, q1)
-	if err != nil {
+		log.Println(out)
 		return err
 	}
 	return nil
 }
 
 func (p *PythonIde) HandleCommand(i *IdeCommand) error {
-	if i.Command == "Def" {
+	if i.Command == "Goto" && i.Button == AcmeButtonThree {
+		// Right click on Goto is like GoToDefinition
 		body, err := GetAcmeWindowBody(p.acmeWin)
 		if err != nil {
 			return err
@@ -787,14 +696,54 @@ func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 		if err == nil {
 			log.Printf("Received Multi Response: %+v\n", fileLocations)
 			options := fmt.Sprintf("\n%s\n", fileLocations.String())
-			gw, err := GetGlobalWindow("Definitions" + GlobalWindowSuffix)
+			err = p.WriteToErrors(options)
 			if err != nil {
-				log.Printf("Failed to get OutputGlobalWindow\n")
+				log.Printf("Error writing Errors: %s\n", err)
 				return err
 			}
-			err = gw.AddContent(options)
+		}
+	} else if i.Command == "Goto" && i.Button == AcmeButtonTwo {
+		// Left click on Goto is like GoToReferences
+		body, err := GetAcmeWindowBody(p.acmeWin)
+		if err != nil {
+			return err
+		}
+		lineAndColumn, err := GetAcmeWindowLineAndColumn(p.acmeWin, body)
+		if err != nil {
+			return err
+		}
+		log.Printf("lineAndColumn: %d, %d\n", lineAndColumn.Line, lineAndColumn.Column)
+		ycmdRequest := &YcmdRequest{
+			LineNum:          lineAndColumn.Line,
+			ColumnNum:        lineAndColumn.Column,
+			Filepath:         p.Name(),
+			FileContents:     body,
+			CommandArguments: []string{"GoToReferences"},
+			Filetypes:        []string{"python"},
+		}
+		blob, err := PostHandler("run_completer_command", ycmdRequest)
+		if err != nil {
+			return err
+		}
+		var (
+			fileLocation  = FileLocation{}
+			fileLocations = FileLocations{}
+		)
+		err = json.Unmarshal(blob, &fileLocation)
+		if err == nil {
+			err = AcmeJumpTo(p, p.acmeWin, &fileLocation)
 			if err != nil {
-				log.Printf("Error writing OutputGlobalWindow: %s\n", err)
+				return err
+			}
+			goto DONE
+		}
+		err = json.Unmarshal(blob, &fileLocations)
+		if err == nil {
+			log.Printf("Received Multi Response: %+v\n", fileLocations)
+			options := fmt.Sprintf("\n%s\n", fileLocations.String())
+			err = p.WriteToErrors(options)
+			if err != nil {
+				log.Printf("Error writing Errors: %s\n", err)
 				return err
 			}
 		}
@@ -831,31 +780,11 @@ func NewIde(winId int, winName string) Ide {
 	windowType := DetermineWindowType(winName)
 	if windowType == PythonWindow {
 		return NewPythonIde(winId, winName)
-	} else if windowType == GlobalWindowWindow {
-		return NewGlobalWindowIde(winId, winName)
 	}
 	return nil
 }
 
 func WatchWindow(winId int, winName string) {
-	if winName == "" {
-		// We do this dance because there's a race when a global window is allocated. We
-		// have to wait for the lock and requery acme for the name, since it comes in as blank.
-		winName = func(givenWinId int, givenWinName string) string {
-			globalWindowsLock.Lock()
-			defer globalWindowsLock.Unlock()
-			windows, err := acme.Windows()
-			if err != nil {
-				return givenWinName
-			}
-			for _, window := range windows {
-				if window.ID == givenWinId {
-					return window.Name
-				}
-			}
-			return givenWinName
-		}(winId, winName)
-	}
 	log.Printf("Found window: %s\n", winName)
 	ide := NewIde(winId, winName)
 	if ide == nil {
@@ -887,14 +816,14 @@ func main() {
 	UpdateCurrentSettings(DefaultSettings())
 	SetHmacSecret(GenerateHmacSecret())
 	go YcmdForever(argv[1])
-	if IsReady() {
+	if IsReady(100 * time.Millisecond) {
 		log.Println("Ycmd Ready!")
 	}
 	// Keep Ycmd alive.
 	go func() {
 		for {
 			// IsReady waits a while interally before querying, so it's fine to hot loop here.
-			IsReady()
+			IsReady(30 * time.Second)
 		}
 	}()
 	for _, winInfo := range winInfos {

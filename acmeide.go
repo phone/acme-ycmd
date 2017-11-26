@@ -95,11 +95,11 @@ func GetCurrentPort() string {
 func GetSettingsJson() string {
 	currentSettingsLock.Lock()
 	defer currentSettingsLock.Unlock()
-	bytes, err := json.Marshal(currentSettings)
+	bs, err := json.Marshal(currentSettings)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return string(bytes)
+	return string(bs)
 }
 
 func SetHmacSecret(hmacSecret string) {
@@ -272,36 +272,39 @@ func IsReady() bool {
 	return data.(bool)
 }
 
+const GlobalWindowSuffix = "+IDE"
 const PythonTag = "Def Refs Fwd Bck In Out Up Dwn Find Case"
 
 type WindowType int
 
 const (
-	NewAcmeWindow    WindowType = iota
-	UnknownWindow    WindowType = iota
-	CcWindow         WindowType = iota
-	PythonWindow     WindowType = iota
-	JavaWindow       WindowType = iota
-	GoWindow         WindowType = iota
-	JavascriptWindow WindowType = iota
-	RustWindow       WindowType = iota
-	CSharpWindow     WindowType = iota
-	DirectoryWindow  WindowType = iota
-	WinWindow        WindowType = iota
+	NewAcmeWindow      WindowType = iota
+	UnknownWindow      WindowType = iota
+	CcWindow           WindowType = iota
+	PythonWindow       WindowType = iota
+	JavaWindow         WindowType = iota
+	GoWindow           WindowType = iota
+	JavascriptWindow   WindowType = iota
+	RustWindow         WindowType = iota
+	CSharpWindow       WindowType = iota
+	DirectoryWindow    WindowType = iota
+	WinWindow          WindowType = iota
+	GlobalWindowWindow WindowType = iota
 )
 
 var windowSuffixesLock sync.Mutex
 var windowSuffixes = map[string]WindowType{
-	".py":  PythonWindow,
-	".c":   CcWindow,
-	".cpp": CcWindow,
-	".cc":  CcWindow,
-	".C":   CcWindow,
-	".h":   CcWindow,
-	".hh":  CcWindow,
-	".H":   CcWindow,
-	".hpp": CcWindow,
-	"/":    DirectoryWindow,
+	".py":              PythonWindow,
+	".c":               CcWindow,
+	".cpp":             CcWindow,
+	".cc":              CcWindow,
+	".C":               CcWindow,
+	".h":               CcWindow,
+	".hh":              CcWindow,
+	".H":               CcWindow,
+	".hpp":             CcWindow,
+	"/":                DirectoryWindow,
+	GlobalWindowSuffix: GlobalWindowWindow,
 }
 
 func WindowSuffixes() (map[string]WindowType, error) {
@@ -431,6 +434,75 @@ type Ide interface {
 
 	// The window id
 	Id() int
+}
+
+var globalWindows = make(map[string]*GlobalWindow)
+var globalWindowsLock sync.Mutex
+
+func GetGlobalWindow(name string) (*GlobalWindow, error) {
+	globalWindowsLock.Lock()
+	defer globalWindowsLock.Unlock()
+	gw, ok := globalWindows[name]
+	if !ok {
+		gw, err := NewGlobalWindow()
+		if err != nil {
+			return nil, err
+		}
+		gw.win.Name(name)
+		globalWindows[name] = gw
+	}
+	return gw, nil
+}
+
+func DestroyGlobalWindow(name string) error {
+	globalWindowsLock.Lock()
+	defer globalWindowsLock.Unlock()
+	delete(globalWindows, name)
+	return nil
+}
+
+type GlobalWindowIde struct {
+	id   int
+	name string
+	gw   *GlobalWindow
+}
+
+func NewGlobalWindowIde(winId int, winName string) *GlobalWindowIde {
+	return &GlobalWindowIde{id: winId, name: winName}
+}
+
+func (g *GlobalWindowIde) Setup() error {
+	// Just make sure it exists and is set up, etc.
+	var err error
+	g.gw, err = GetGlobalWindow(g.name)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (g *GlobalWindowIde) Watch() {
+	log.Printf("GlobalWindow: %+v\n", g.gw)
+	// The only thing we have to watch for here is when it closes, so we can remove the references.
+	events := g.gw.EventChan()
+	for {
+		_, ok := <-events
+		if !ok {
+			break
+		}
+	}
+}
+
+func (g *GlobalWindowIde) Teardown() {
+	DestroyGlobalWindow(g.name)
+}
+
+func (g *GlobalWindowIde) Name() string {
+	return g.name
+}
+
+func (g *GlobalWindowIde) Id() int {
+	return g.id
 }
 
 type PythonIde struct {
@@ -575,23 +647,17 @@ func AcmeWinIsDirty(win *acme.Win) (bool, error) {
 	return dirty == 1, nil
 }
 
-type AcmeLocation struct {
-	Filepath  string
-	LineNum   int
-	ColumnNum int
-}
-
-func AcmeJumpTo(ide Ide, win *acme.Win, filepath string, lineNum, columnNum int) error {
+func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 	acmeWinIsDirty, err := AcmeWinIsDirty(win)
 	if err != nil {
 		return err
 	}
 
-	if acmeWinIsDirty || ide.Name() == filepath {
+	if acmeWinIsDirty || ide.Name() == fileLocation.Filepath {
 		log.Println("AcmeJumpTo: Window is dirty or same window.")
 		// If the window is dirty, plumb the location to a new window so we don't lose any changes. If the window is
 		// already open somewhere, zap to it. We can also do this when we're zapping somewhere else in the same file.
-		cmd := exec.Command("plumb", fmt.Sprintf("%s:%d:%d", filepath, lineNum, columnNum))
+		cmd := exec.Command("plumb", fileLocation.String())
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			log.Println(string(output))
@@ -605,25 +671,24 @@ func AcmeJumpTo(ide Ide, win *acme.Win, filepath string, lineNum, columnNum int)
 			return err
 		}
 		log.Println("AcmeJumpTo: Set addr")
-		fileContents, err := ioutil.ReadFile(filepath)
+		fileContents, err := ioutil.ReadFile(fileLocation.Filepath)
 		if err != nil {
 			return err
 		}
-		log.Println("AcmeJumpTo: Read file " + filepath)
+		log.Println("AcmeJumpTo: Read file " + fileLocation.Filepath)
 		_, err = win.Write("data", fileContents)
 		if err != nil {
 			return err
 		}
 		log.Println("AcmeJumpTo: wrote data")
-		err = win.Name(filepath)
+		err = win.Name(fileLocation.Filepath)
 		if err != nil {
 			return err
 		}
 		log.Println("AcmeJumpTo: wrote name")
-		newAddr := fmt.Sprintf("%d-+#%d", lineNum, columnNum)
-		err = win.Addr(newAddr)
+		err = win.Addr(fileLocation.Addr())
 		if err != nil {
-			log.Printf("AcmeJumpTo: error writing addr: %s\n", newAddr)
+			log.Printf("AcmeJumpTo: error writing addr: %s\n", fileLocation.Addr())
 			return err
 		}
 		err = win.Ctl("dot=addr")
@@ -638,6 +703,47 @@ func AcmeJumpTo(ide Ide, win *acme.Win, filepath string, lineNum, columnNum int)
 		if err != nil {
 			log.Printf("AcmeJumpTo: error writing ctl: show\n")
 		}
+	}
+	return nil
+}
+
+type GlobalWindow struct {
+	sync.Mutex
+	win *acme.Win
+}
+
+func NewGlobalWindow() (*GlobalWindow, error) {
+	w, err := acme.New()
+	if err != nil {
+		return nil, err
+	}
+	return &GlobalWindow{win: w}, nil
+}
+
+func (g *GlobalWindow) EventChan() <-chan *acme.Event {
+	g.Lock()
+	defer g.Unlock()
+	return g.win.EventChan()
+}
+
+func (g *GlobalWindow) AddContent(format string, args ...interface{}) error {
+	g.Lock()
+	defer g.Unlock()
+	err := g.win.Addr("$")
+	if err != nil {
+		return err
+	}
+	q0, q1, err := g.win.ReadAddr()
+	if err != nil {
+		return err
+	}
+	err = g.win.Fprintf("data", format, args...)
+	if err != nil {
+		return err
+	}
+	err = g.win.Addr("#%d,#%d", q0, q1)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -666,23 +772,31 @@ func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 			return err
 		}
 		var (
-			ycmdGoToSingleResponse = &YcmdGoToSingleResponse{}
-			ycmdGoToMultiResponse  = &YcmdGoToMultiResponse{}
+			fileLocation  = FileLocation{}
+			fileLocations = FileLocations{}
 		)
-		err = json.Unmarshal(blob, ycmdGoToSingleResponse)
+		err = json.Unmarshal(blob, &fileLocation)
 		if err == nil {
-			err = AcmeJumpTo(p, p.acmeWin, ycmdGoToSingleResponse.Filepath,
-				ycmdGoToSingleResponse.LineNum, ycmdGoToSingleResponse.ColumnNum)
+			err = AcmeJumpTo(p, p.acmeWin, &fileLocation)
 			if err != nil {
 				return err
 			}
 			goto DONE
-		} else {
-			log.Printf("Json Unmarshal error: %s\n", string(blob))
 		}
-		err = json.Unmarshal(blob, ycmdGoToMultiResponse)
+		err = json.Unmarshal(blob, &fileLocations)
 		if err == nil {
-			log.Println("Received Multi Response")
+			log.Printf("Received Multi Response: %+v\n", fileLocations)
+			options := fmt.Sprintf("\n%s\n", fileLocations.String())
+			gw, err := GetGlobalWindow("Definitions" + GlobalWindowSuffix)
+			if err != nil {
+				log.Printf("Failed to get OutputGlobalWindow\n")
+				return err
+			}
+			err = gw.AddContent(options)
+			if err != nil {
+				log.Printf("Error writing OutputGlobalWindow: %s\n", err)
+				return err
+			}
 		}
 	}
 DONE:
@@ -717,13 +831,32 @@ func NewIde(winId int, winName string) Ide {
 	windowType := DetermineWindowType(winName)
 	if windowType == PythonWindow {
 		return NewPythonIde(winId, winName)
+	} else if windowType == GlobalWindowWindow {
+		return NewGlobalWindowIde(winId, winName)
 	}
 	return nil
 }
 
 func WatchWindow(winId int, winName string) {
+	if winName == "" {
+		// We do this dance because there's a race when a global window is allocated. We
+		// have to wait for the lock and requery acme for the name, since it comes in as blank.
+		winName = func(givenWinId int, givenWinName string) string {
+			globalWindowsLock.Lock()
+			defer globalWindowsLock.Unlock()
+			windows, err := acme.Windows()
+			if err != nil {
+				return givenWinName
+			}
+			for _, window := range windows {
+				if window.ID == givenWinId {
+					return window.Name
+				}
+			}
+			return givenWinName
+		}(winId, winName)
+	}
 	log.Printf("Found window: %s\n", winName)
-
 	ide := NewIde(winId, winName)
 	if ide == nil {
 		return
@@ -741,7 +874,7 @@ func WatchWindow(winId int, winName string) {
 func main() {
 	argv := os.Args
 	if len(argv) < 1 {
-		log.Fatal(errors.New("Path to ycmd required."))
+		log.Fatal(errors.New("path to ycmd required"))
 	}
 	logReader, err := acme.Log()
 	if err != nil {

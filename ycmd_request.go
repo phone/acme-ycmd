@@ -1,6 +1,10 @@
 package main
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 const (
 	YcmdEventFileReadyToParse          = 1
@@ -41,11 +45,35 @@ func (r *YcmdRequest) MarshalJSON() ([]byte, error) {
 	return json.Marshal(blob)
 }
 
-type YcmdGoToSingleResponse struct {
+type FileLocation struct {
 	LineNum     int    `json:"line_num"`
 	ColumnNum   int    `json:"column_num"`
 	Filepath    string `json:"filepath"`
 	Description string `json:"description"`
 }
 
-type YcmdGoToMultiResponse []YcmdGoToSingleResponse
+func (y *FileLocation) String() string {
+	return fmt.Sprintf("%s:%d:%d", y.Filepath, y.LineNum, y.ColumnNum)
+}
+
+func (y *FileLocation) DescriptionString() string {
+	if len(y.Description) > 0 {
+		return fmt.Sprintf("%s:%d:%s%s", y.Filepath, y.LineNum, strings.Repeat(" ", y.ColumnNum), y.Description)
+	} else {
+		return fmt.Sprintf("%s:%s", y.Filepath, y.LineNum)
+	}
+}
+
+func (y *FileLocation) Addr() string {
+	return fmt.Sprintf("%d-+#%d", y.LineNum, y.ColumnNum)
+}
+
+type FileLocations []FileLocation
+
+func (ym FileLocations) String() string {
+	options := make([]string, 0, len(ym))
+	for _, y := range ym {
+		options = append(options, y.DescriptionString())
+	}
+	return strings.Join(options, "\n")
+}

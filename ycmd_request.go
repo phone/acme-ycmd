@@ -6,14 +6,6 @@ import (
 	"strings"
 )
 
-const (
-	YcmdEventFileReadyToParse          = 1
-	YcmdEventBufferUnload              = 2
-	YcmdEventBufferVisit               = 3
-	YcmdEventInsertLeave               = 4
-	YcmdEventCurrentIdentifierFinished = 5
-)
-
 type YcmdRequest struct {
 	LineNum          int
 	ColumnNum        int

@@ -155,7 +155,6 @@ func CreateHmac(content, secret []byte) []byte {
 }
 
 func CreateRequestHmac(method, path, body, hmacSecret string) []byte {
-	log.Println("Hmacing " + method + " " + path)
 	secret, err := base64.StdEncoding.DecodeString(hmacSecret)
 	if err != nil {
 		log.Fatal(err)
@@ -167,7 +166,6 @@ func CreateRequestHmac(method, path, body, hmacSecret string) []byte {
 	joinedHmac = append(joinedHmac, methodHmac...)
 	joinedHmac = append(joinedHmac, pathHmac...)
 	joinedHmac = append(joinedHmac, bodyHmac...)
-	log.Println("Hmac bytes: " + strconv.Itoa(len(joinedHmac)))
 	return CreateHmac(joinedHmac, secret)
 }
 
@@ -277,7 +275,7 @@ func IsReady(duration time.Duration) bool {
 }
 
 const GlobalWindowSuffix = "+IDE"
-const PythonTag = "Goto Nav In Out Up Dwn Find Case"
+const PythonTag = "Goto Nav Diag"
 
 type WindowType int
 
@@ -501,12 +499,7 @@ func (p *PythonIde) Teardown() {
 var PythonIdeCommands = map[string]struct{}{
 	"Goto": {},
 	"Nav":  {},
-	"In":   {},
-	"Out":  {},
-	"Up":   {},
-	"Dwn":  {},
-	"Find": {},
-	"Case": {},
+	"Diag": {},
 }
 
 type IdeCommand struct {
@@ -586,13 +579,36 @@ func AcmeWinIsDirty(win *acme.Win) (bool, error) {
 	return dirty == 1, nil
 }
 
+func AcmeFilepathIsAlreadyOpen(filepath string) (bool, error) {
+	windows, err := acme.Windows()
+	if err != nil {
+		return false, err
+	}
+	for _, window := range windows {
+		if window.Name == filepath {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 	acmeWinIsDirty, err := AcmeWinIsDirty(win)
 	if err != nil {
 		return err
 	}
-
-	if acmeWinIsDirty || ide.Name() == fileLocation.Filepath {
+	usePlumber := acmeWinIsDirty || ide.Name() == fileLocation.Filepath
+	if !usePlumber {
+		// This is a little more expensive, so don't do it unless we fail the other tests for using the plumber.
+		acmeFilepathIsAlreadyOpen, err := AcmeFilepathIsAlreadyOpen(fileLocation.Filepath)
+		if err != nil {
+			// If we get errors here, let's just try to plumb the file. I think that's better than opening in place and
+			// then possibly having two windows of the same file open.
+			acmeFilepathIsAlreadyOpen = true
+		}
+		usePlumber = acmeFilepathIsAlreadyOpen
+	}
+	if usePlumber {
 		log.Println("AcmeJumpTo: Window is dirty or same window.")
 		// If the window is dirty, plumb the location to a new window so we don't lose any changes. If the window is
 		// already open somewhere, zap to it. We can also do this when we're zapping somewhere else in the same file.
@@ -603,6 +619,7 @@ func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 			return err
 		}
 	} else {
+		// Special case to open in place if the window is clean, and the destination file isn't already open.
 		log.Println("AcmeJumpTo: Window is clean. Replacing")
 		// Open the new location in place
 		err = win.Addr("0,$")
@@ -804,6 +821,55 @@ func (p *PythonIde) Watch() {
 	}
 }
 
+type JumpRecord struct {
+	Prev     *JumpRecord
+	Next     *JumpRecord
+	Location *FileLocation
+}
+
+var history *JumpRecord
+var historyLock sync.Mutex
+
+func PushHistory(fileLocation *FileLocation) {
+	historyLock.Lock()
+	defer historyLock.Unlock()
+	jr := &JumpRecord{Prev: history, Location: fileLocation}
+	history.Next = jr
+	history = jr
+}
+
+func PeekHistory() *FileLocation {
+	historyLock.Lock()
+	defer historyLock.Unlock()
+	return history.Location
+}
+
+func ForwardHistory(ide Ide, win *acme.Win) error {
+	historyLock.Lock()
+	defer historyLock.Unlock()
+	if history.Next != nil {
+		err := AcmeJumpTo(ide, win, history.Next.Location)
+		if err != nil {
+			return err
+		}
+		history = history.Next
+	}
+	return nil
+}
+
+func BackHistory(ide Ide, win *acme.Win) error {
+	historyLock.Lock()
+	defer historyLock.Unlock()
+	if history.Prev != nil {
+		err := AcmeJumpTo(ide, win, history.Prev.Location)
+		if err != nil {
+			return err
+		}
+		history = history.Prev
+	}
+	return nil
+}
+
 func NewPythonIde(winId int, winName string) *PythonIde {
 	return &PythonIde{id: winId, name: winName}
 }
@@ -854,7 +920,7 @@ func main() {
 	// Keep Ycmd alive.
 	go func() {
 		for {
-			// IsReady waits a while interally before querying, so it's fine to hot loop here.
+			// IsReady waits a while internally before querying, so it's fine to hot loop here.
 			IsReady(30 * time.Second)
 		}
 	}()

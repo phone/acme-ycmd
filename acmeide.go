@@ -440,6 +440,54 @@ type Ide interface {
 	Rename(name string)
 }
 
+type DefaultIde struct {
+	id      int
+	name    string
+	acmeWin *acme.Win
+}
+
+func (p *DefaultIde) Name() string {
+	return p.name
+}
+
+func (p *DefaultIde) Rename(name string) {
+	p.name = name
+}
+
+func (p *DefaultIde) Id() int {
+	return p.id
+}
+
+func (p *DefaultIde) Setup() error {
+	var err error
+	p.acmeWin, err = acme.Open(p.Id(), nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *DefaultIde) Watch() {
+	events := p.acmeWin.EventChan()
+	for {
+		e, ok := <-events
+		if !ok {
+			break
+		}
+		err := CheckEventForHistoryAddition(e)
+		if err != nil {
+			log.Printf("Error recording history entry for %s: %+v\n", p.Name(), e)
+		}
+		p.acmeWin.WriteEvent(e)
+		continue
+	}
+}
+
+func (p *DefaultIde) Teardown() {
+	p.acmeWin.CloseFiles()
+}
+
+
 type PythonIde struct {
 	id      int
 	name    string
@@ -592,15 +640,15 @@ func AcmeFilepathIsAlreadyOpen(filepath string) (bool, error) {
 	return false, nil
 }
 
-func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
+func AcmeJumpTo(ide Ide, win *acme.Win, location Location, pushHistory bool) error {
 	acmeWinIsDirty, err := AcmeWinIsDirty(win)
 	if err != nil {
 		return err
 	}
-	usePlumber := acmeWinIsDirty || ide.Name() == fileLocation.Filepath
+	usePlumber := acmeWinIsDirty || ide.Name() == location.Path()
 	if !usePlumber {
 		// This is a little more expensive, so don't do it unless we fail the other tests for using the plumber.
-		acmeFilepathIsAlreadyOpen, err := AcmeFilepathIsAlreadyOpen(fileLocation.Filepath)
+		acmeFilepathIsAlreadyOpen, err := AcmeFilepathIsAlreadyOpen(location.Path())
 		if err != nil {
 			// If we get errors here, let's just try to plumb the file. I think that's better than opening in place and
 			// then possibly having two windows of the same file open.
@@ -612,11 +660,14 @@ func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 		log.Println("AcmeJumpTo: Window is dirty or same window.")
 		// If the window is dirty, plumb the location to a new window so we don't lose any changes. If the window is
 		// already open somewhere, zap to it. We can also do this when we're zapping somewhere else in the same file.
-		cmd := exec.Command("plumb", fileLocation.String())
+		cmd := exec.Command("plumb", location.String())
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			log.Println(string(output))
+			log.Println("plumb " + location.String()+ ": " + string(output))
 			return err
+		}
+		if pushHistory {
+			PushHistory(location)
 		}
 	} else {
 		// Special case to open in place if the window is clean, and the destination file isn't already open.
@@ -627,25 +678,25 @@ func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 			return err
 		}
 		log.Println("AcmeJumpTo: Set addr")
-		fileContents, err := ioutil.ReadFile(fileLocation.Filepath)
+		fileContents, err := ioutil.ReadFile(location.Path())
 		if err != nil {
 			return err
 		}
-		log.Println("AcmeJumpTo: Read file " + fileLocation.Filepath)
+		log.Println("AcmeJumpTo: Read file " + location.Path())
 		_, err = win.Write("data", fileContents)
 		if err != nil {
 			return err
 		}
 		log.Println("AcmeJumpTo: wrote data")
-		err = win.Name(fileLocation.Filepath)
+		err = win.Name(location.Path())
 		if err != nil {
 			return err
 		}
-		ide.Rename(fileLocation.Filepath)
+		ide.Rename(location.Path())
 		log.Println("AcmeJumpTo: wrote name")
-		err = win.Addr(fileLocation.Addr())
+		err = win.Addr(location.Addr())
 		if err != nil {
-			log.Printf("AcmeJumpTo: error writing addr: %s\n", fileLocation.Addr())
+			log.Printf("AcmeJumpTo: error writing addr: %s\n", location.Addr())
 			return err
 		}
 		err = win.Ctl("dot=addr")
@@ -659,6 +710,9 @@ func AcmeJumpTo(ide Ide, win *acme.Win, fileLocation *FileLocation) error {
 		err = win.Ctl("show")
 		if err != nil {
 			log.Printf("AcmeJumpTo: error writing ctl: show\n")
+		}
+		if pushHistory {
+			PushHistory(location)
 		}
 	}
 	return nil
@@ -706,6 +760,20 @@ func (p *PythonIde) WriteToErrors(content string) error {
 }
 
 func (p *PythonIde) HandleCommand(i *IdeCommand) error {
+	if i.Command == "Nav" && i.Button == AcmeButtonThree {
+		err := BackHistory(p, p.acmeWin)
+		if err != nil {
+			return err
+		}
+		goto DONE
+	}
+	if i.Command == "Nav" && i.Button == AcmeButtonTwo {
+		err := ForwardHistory(p, p.acmeWin)
+		if err != nil {
+			return err
+		}
+		goto DONE
+	}
 	if i.Command == "Goto" && i.Button == AcmeButtonThree {
 		// Right click on Goto is like GoToDefinition
 		body, err := GetAcmeWindowBody(p.acmeWin)
@@ -735,7 +803,7 @@ func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 		)
 		err = json.Unmarshal(blob, &fileLocation)
 		if err == nil {
-			err = AcmeJumpTo(p, p.acmeWin, &fileLocation)
+			err = AcmeJumpTo(p, p.acmeWin, &fileLocation, true)
 			if err != nil {
 				return err
 			}
@@ -750,8 +818,11 @@ func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 				log.Printf("Error writing Errors: %s\n", err)
 				return err
 			}
+			goto DONE
 		}
-	} else if i.Command == "Goto" && i.Button == AcmeButtonTwo {
+		return err
+	}
+	if i.Command == "Goto" && i.Button == AcmeButtonTwo {
 		// Left click on Goto is like GoToReferences
 		body, err := GetAcmeWindowBody(p.acmeWin)
 		if err != nil {
@@ -780,10 +851,11 @@ func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 		)
 		err = json.Unmarshal(blob, &fileLocation)
 		if err == nil {
-			err = AcmeJumpTo(p, p.acmeWin, &fileLocation)
+			err = AcmeJumpTo(p, p.acmeWin, &fileLocation, true)
 			if err != nil {
 				return err
 			}
+			PushHistory(&fileLocation)
 			goto DONE
 		}
 		err = json.Unmarshal(blob, &fileLocations)
@@ -796,8 +868,35 @@ func (p *PythonIde) HandleCommand(i *IdeCommand) error {
 				return err
 			}
 		}
+		goto DONE
 	}
 DONE:
+	return nil
+}
+
+func GetWinDot(win *acme.Win, winName string) (*DotLocation, error) {
+	err := win.Ctl("addr=dot")
+	if err != nil {
+		return nil, err
+	}
+	q0, q1, err := win.ReadAddr()
+	if err != nil {
+		return nil, err
+	}
+	return &DotLocation{Q0:q0, Q1:q1, Filepath:winName}, nil
+}
+
+func CheckEventForHistoryAddition(e *acme.Event) error {
+	area, _ := WhichAcmeArea(e)
+	button, _ := WhichAcmeButton(e)
+	if area == AcmeAreaBody && button == AcmeButtonThree && e.Flag&1 != 0 && e.Flag&4 != 0 {
+		rawLocation, err := NewRawPlumberLocation(string(e.Text))
+		if err != nil {
+			return err
+		}
+		PushHistory(rawLocation)
+		return nil
+	}
 	return nil
 }
 
@@ -815,6 +914,10 @@ func (p *PythonIde) Watch() {
 				log.Printf("HandleCommand error: %s\n", err)
 			}
 		} else {
+			err := CheckEventForHistoryAddition(e)
+			if err != nil {
+				log.Printf("Error recording history entry for %s: %+v\n", p.Name(), e)
+			}
 			p.acmeWin.WriteEvent(e)
 			continue
 		}
@@ -824,31 +927,29 @@ func (p *PythonIde) Watch() {
 type JumpRecord struct {
 	Prev     *JumpRecord
 	Next     *JumpRecord
-	Location *FileLocation
+	Location Location
 }
 
 var history *JumpRecord
 var historyLock sync.Mutex
 
-func PushHistory(fileLocation *FileLocation) {
+func PushHistory(location Location) {
+	log.Printf("Pushing history: %s\n", location.String())
 	historyLock.Lock()
 	defer historyLock.Unlock()
-	jr := &JumpRecord{Prev: history, Location: fileLocation}
-	history.Next = jr
+	jr := &JumpRecord{Prev: history, Location: location}
+	if history != nil {
+		history.Next = jr
+		history = jr
+	}
 	history = jr
-}
-
-func PeekHistory() *FileLocation {
-	historyLock.Lock()
-	defer historyLock.Unlock()
-	return history.Location
 }
 
 func ForwardHistory(ide Ide, win *acme.Win) error {
 	historyLock.Lock()
 	defer historyLock.Unlock()
 	if history.Next != nil {
-		err := AcmeJumpTo(ide, win, history.Next.Location)
+		err := AcmeJumpTo(ide, win, history.Next.Location, false)
 		if err != nil {
 			return err
 		}
@@ -857,11 +958,27 @@ func ForwardHistory(ide Ide, win *acme.Win) error {
 	return nil
 }
 
+// Jump back a history location, with the following rules:
+// If the most recent history location is significantly different from
+// where you are now, jump to the most recent history location.
+// Otherwise, if it looks like we're at the most recent history location,
+// jump back to the previous history location and update the history pointer.
+// If we can't jump back any further, do nothing.
 func BackHistory(ide Ide, win *acme.Win) error {
+	dotLocation, err := GetWinDot(win, ide.Name())
+	if err != nil {
+		return err
+	}
 	historyLock.Lock()
 	defer historyLock.Unlock()
+	if dotLocation.Path() != history.Location.Path() {
+		err := AcmeJumpTo(ide, win, history.Location, false)
+		if err != nil {
+			return err
+		}
+	}
 	if history.Prev != nil {
-		err := AcmeJumpTo(ide, win, history.Prev.Location)
+		err := AcmeJumpTo(ide, win, history.Prev.Location, false)
 		if err != nil {
 			return err
 		}
@@ -874,10 +991,16 @@ func NewPythonIde(winId int, winName string) *PythonIde {
 	return &PythonIde{id: winId, name: winName}
 }
 
+func NewDefaultIde(winId int, winName string) *DefaultIde {
+	return &DefaultIde{id: winId, name: winName}
+}
+
 func NewIde(winId int, winName string) Ide {
 	windowType := DetermineWindowType(winName)
 	if windowType == PythonWindow {
 		return NewPythonIde(winId, winName)
+	} else {
+		return NewDefaultIde(winId, winName)
 	}
 	return nil
 }
